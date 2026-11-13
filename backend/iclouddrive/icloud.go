@@ -324,6 +324,11 @@ func init() {
 			Advanced: true,
 			Default:  "d39ba9916b7251055b22c7f910e2ea796ee65e98b2ddecea8f5dde8d9d1a815d",
 		}, {
+			Name:     "download_batch_size",
+			Help:     "Number of download links to request together (Drive only).\n\n0 or 1 disables batching. Up to 100 links may be requested per batch.\nBatches wait at most 20ms for concurrent transfers to form.",
+			Advanced: true,
+			Default:  0,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,

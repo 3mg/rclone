@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -52,27 +53,144 @@ const (
 
 // Options defines the configuration for this backend
 type Options struct {
-	AppleID    string               `config:"apple_id"`
-	Password   string               `config:"password"`
-	TrustToken string               `config:"trust_token"`
-	Region     string               `config:"region"`
-	Cookies    string               `config:"cookies"`
-	ClientID   string               `config:"client_id"`
-	Enc        encoder.MultiEncoder `config:"encoding"`
+	DownloadBatchSize int                  `config:"download_batch_size"`
+	AppleID           string               `config:"apple_id"`
+	Password          string               `config:"password"`
+	TrustToken        string               `config:"trust_token"`
+	Region            string               `config:"region"`
+	Cookies           string               `config:"cookies"`
+	ClientID          string               `config:"client_id"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote icloud drive
 type Fs struct {
-	name     string // name of this remote
-	root     string // the path we are working on.
-	rootID   string
-	opt      Options            // parsed config options
-	m        configmap.Mapper   // config map for persisting auth state
-	features *fs.Features       // optional features
-	dirCache *dircache.DirCache // Map of directory path to directory id
-	icloud   *api.Client
-	service  *api.DriveService
-	pacer    *fs.Pacer // pacer for API calls
+	downloads *downloadBatcher
+	name      string // name of this remote
+	root      string // the path we are working on.
+	rootID    string
+	opt       Options            // parsed config options
+	m         configmap.Mapper   // config map for persisting auth state
+	features  *fs.Features       // optional features
+	dirCache  *dircache.DirCache // Map of directory path to directory id
+	icloud    *api.Client
+	service   *api.DriveService
+	pacer     *fs.Pacer // pacer for API calls
+}
+
+type downloadRequest struct {
+	ctx    context.Context
+	id     string
+	result chan downloadResponse
+}
+
+type downloadResponse struct {
+	url  string
+	resp *http.Response
+	err  error
+}
+
+type downloadBatcher struct {
+	requests chan downloadRequest
+	cancel   context.CancelFunc
+	done     <-chan struct{}
+	wg       sync.WaitGroup
+}
+
+func newDownloadBatcher(ctx context.Context, size, workers int, fetch func(context.Context, []string) ([]api.DownloadURL, *http.Response, error)) *downloadBatcher {
+	// Cached filesystems outlive the request that creates them.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	b := &downloadBatcher{requests: make(chan downloadRequest), cancel: cancel, done: ctx.Done()}
+	for range workers {
+		b.wg.Add(1)
+		go func() {
+			defer b.wg.Done()
+			for {
+				var requests []downloadRequest
+				select {
+				case <-ctx.Done():
+					return
+				case request := <-b.requests:
+					requests = append(requests, request)
+				}
+				timer := time.NewTimer(20 * time.Millisecond)
+			collect:
+				for len(requests) < size {
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return
+					case <-timer.C:
+						break collect
+					case request := <-b.requests:
+						requests = append(requests, request)
+					}
+				}
+				timer.Stop()
+				// A remote can contain documents from several application zones.
+				zones := make(map[string][]downloadRequest)
+				for _, request := range requests {
+					if request.ctx.Err() == nil {
+						zone := api.ZoneFromDriveID(request.id)
+						zones[zone] = append(zones[zone], request)
+					}
+				}
+				for _, group := range zones {
+					ids := make([]string, len(group))
+					for i := range group {
+						ids[i] = group[i].id
+					}
+					start := time.Now()
+					results, resp, err := fetch(ctx, ids)
+					fs.Debugf(nil, "iclouddrive download batch: files=%d duration=%v", len(ids), time.Since(start))
+					for i, request := range group {
+						result := downloadResponse{resp: resp, err: err}
+						if err == nil {
+							result.url, result.err = results[i].URL, results[i].Err
+						}
+						request.result <- result
+					}
+				}
+			}
+		}()
+	}
+	return b
+}
+
+func (b *downloadBatcher) get(ctx context.Context, id string) (string, *http.Response, error) {
+	request := downloadRequest{ctx: ctx, id: id, result: make(chan downloadResponse, 1)}
+	select {
+	case <-ctx.Done():
+		return "", nil, ctx.Err()
+	case <-b.done:
+		return "", nil, context.Canceled
+	case b.requests <- request:
+	}
+	select {
+	case <-ctx.Done():
+		return "", nil, ctx.Err()
+	case <-b.done:
+		return "", nil, context.Canceled
+	case result := <-request.result:
+		return result.url, result.resp, result.err
+	}
+}
+
+func (f *Fs) getDownloadURLs(ctx context.Context, ids []string) (results []api.DownloadURL, resp *http.Response, err error) {
+	err = f.pacer.Call(func() (bool, error) {
+		results, resp, err = f.service.GetDownloadURLsByDriveID(ctx, ids)
+		return shouldRetry(ctx, resp, err)
+	})
+	return
+}
+
+// Shutdown stops pending download-link requests.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.downloads != nil {
+		f.downloads.cancel()
+		f.downloads.wg.Wait()
+	}
+	return nil
 }
 
 // Object describes an icloud drive object
@@ -709,6 +827,14 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
+	if f.opt.DownloadBatchSize < 0 || f.opt.DownloadBatchSize > 100 {
+		return nil, errors.New("download_batch_size must be between 0 and 100")
+	}
+	if f.opt.DownloadBatchSize > 1 {
+		workers := max(1, (fs.GetConfig(ctx).Transfers+f.opt.DownloadBatchSize-1)/f.opt.DownloadBatchSize)
+		f.downloads = newDownloadBatcher(ctx, f.opt.DownloadBatchSize, workers, f.getDownloadURLs)
+	}
+
 	f.dirCache = dircache.New(
 		root,
 		rootID,
@@ -736,6 +862,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 				return f, nil
 			}
 
+			_ = f.Shutdown(ctx)
 			return nil, err
 		}
 
@@ -858,18 +985,21 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	var resp *http.Response
 	var err error
-
+	var url string
+	// Gather concurrent opens before pacing their HTTP requests individually.
+	if o.fs.downloads != nil {
+		url, _, err = o.fs.downloads.get(ctx, o.driveID)
+		if err != nil {
+			return nil, err
+		}
+	}
 	if err = o.fs.pacer.Call(func() (bool, error) {
-		var url string
-
-		//var doc *api.Document
-		//if o.docID == "" {
-		//doc, resp, err = o.fs.service.GetDocByItemID(ctx, o.itemID)
-		//}
-
-		// Can not get the download url on a item to work, so do it the hard way.
-		url, _, err = o.fs.service.GetDownloadURLByDriveID(ctx, o.driveID)
-
+		if o.fs.downloads == nil {
+			url, resp, err = o.fs.service.GetDownloadURLByDriveID(ctx, o.driveID)
+			if err != nil {
+				return shouldRetry(ctx, resp, err)
+			}
+		}
 		resp, err = o.fs.service.DownloadFile(ctx, url, options)
 		return shouldRetry(ctx, resp, err)
 	}); err != nil {
@@ -1019,6 +1149,7 @@ func (f *Fs) Disconnect(ctx context.Context) error {
 var (
 	_ fs.Fs              = &Fs{}
 	_ fs.Disconnecter    = (*Fs)(nil)
+	_ fs.Shutdowner      = (*Fs)(nil)
 	_ fs.Mover           = (*Fs)(nil)
 	_ fs.Purger          = (*Fs)(nil)
 	_ fs.DirMover        = (*Fs)(nil)

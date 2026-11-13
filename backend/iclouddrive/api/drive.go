@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"mime"
 	"net/http"
@@ -232,14 +233,74 @@ func (d *DriveService) GetDownloadURLByDriveID(ctx context.Context, id string) (
 		return "", resp, err
 	}
 
-	var url string
-	if filer.DataToken != nil {
-		url = filer.DataToken.URL
-	} else {
-		url = filer.PackageToken.URL
-	}
+	result := downloadURL(filer)
+	return result.URL, resp, result.Err
+}
 
-	return url, resp, err
+// DownloadURL contains a download link or an error for one requested file.
+type DownloadURL struct {
+	URL string
+	Err error
+}
+
+func downloadURL(file *FileRequest) DownloadURL {
+	if file != nil {
+		if file.DataToken != nil && file.DataToken.URL != "" {
+			return DownloadURL{URL: file.DataToken.URL}
+		}
+		if file.PackageToken != nil && file.PackageToken.URL != "" {
+			return DownloadURL{URL: file.PackageToken.URL}
+		}
+	}
+	return DownloadURL{Err: errors.New("download response has no URL")}
+}
+
+// GetDownloadURLsByDriveID retrieves links for up to 100 files in one zone.
+// Results follow the input order; missing files have an individual error.
+func (d *DriveService) GetDownloadURLsByDriveID(ctx context.Context, ids []string) ([]DownloadURL, *http.Response, error) {
+	if len(ids) == 0 || len(ids) > 100 {
+		return nil, nil, errors.New("download batch must contain 1 to 100 files")
+	}
+	zone := ZoneFromDriveID(ids[0])
+	requested := make(map[string]bool, len(ids))
+	var body []map[string]string
+	for _, id := range ids {
+		_, _, docID := DeconstructDriveID(id)
+		if docID == "" || ZoneFromDriveID(id) != zone {
+			return nil, nil, errors.New("download batch requires document IDs from one zone")
+		}
+		if !requested[docID] {
+			body = append(body, map[string]string{"document_id": docID})
+			requested[docID] = true
+		}
+	}
+	opts := rest.Opts{
+		Method:       "POST",
+		Path:         "/ws/" + zone + "/download/batch",
+		ExtraHeaders: d.icloud.Session.GetHeaders(map[string]string{}),
+		RootURL:      d.docsEndpoint,
+	}
+	var files []*FileRequest
+	resp, err := d.icloud.Request(ctx, opts, body, &files)
+	if err != nil {
+		return nil, resp, err
+	}
+	byID := make(map[string]*FileRequest, len(files))
+	for _, file := range files {
+		if file == nil || !requested[file.DocumentID] {
+			return nil, resp, errors.New("download batch returned an unexpected document")
+		}
+		if _, exists := byID[file.DocumentID]; exists {
+			return nil, resp, errors.New("download batch returned a duplicate document")
+		}
+		byID[file.DocumentID] = file
+	}
+	results := make([]DownloadURL, len(ids))
+	for i, id := range ids {
+		_, _, docID := DeconstructDriveID(id)
+		results[i] = downloadURL(byID[docID])
+	}
+	return results, resp, nil
 }
 
 // DownloadFile downloads a file from the given URL using the provided options.
